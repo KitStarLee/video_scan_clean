@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# 运行产物
+output/
+*.repaired.mp4
+*.repair_report.txt
+# 工具中间文件
+.work/

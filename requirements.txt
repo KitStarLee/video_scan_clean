@@ -1,0 +1,12 @@
+# 必需：外部工具（不是 pip 包）
+#   ffmpeg / ffprobe   —— 解码、重封装、重编码
+#
+# 必需：Python 包
+numpy>=1.20
+Pillow>=9.0
+#
+# 可选
+# psutil>=5.9        —— 更准的内存探测（没有就用 vm_stat / /proc/meminfo）
+#
+# 可选：外部工具
+#   tesseract        —— 水印文字 OCR；认中文需要额外安装 chi_sim 语言包

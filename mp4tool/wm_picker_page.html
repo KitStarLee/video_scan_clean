@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<!--
+  水印区域选择页（由 mp4tool/wm_picker.py 读取并注入数据）。
+
+  想改样式/交互，直接编辑这个文件就行，不用动 Python：
+  · 保存后重新运行即可生效（Python 侧按 mtime 缓存，改完自动重读）。
+  · 下面这些 __XXX__ 是 Python 注入数据的占位符，**不要改名字**：
+      __TITLE__ __FNAME__ __W__ __H__ __N__ __FIRST__ __FRAMES__ __REGIONS__ __SUBMIT__
+      __REGIONS__ 每项 = {x,y,w,h,note,thumb,layer}
+        · layer = 扫描器导出的「水印图层」watermark_regionN_*.png（多帧梯度中位数，
+                  只有水印本身、没有背景）——**优先用它**，看得最清楚
+        · thumb = 兜底：从整帧裁出来的小图
+
+  注意：数字编号 #1/#2… 是**烧在整帧图片里的**（Python 端 PIL 画的），
+  所以这里只画透明的可点击框 + 选中态，**不要再画一遍编号**，否则会出现两套数字。
+
+  布局：左边 = 整帧画面 + 紧挨着它的「水印图层」竖列（鼠标悬停看大图）；
+        右边 = 截图缩略图 → 要去掉的区域 → 处理方式。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>__TITLE__</title>
+<style>
+  :root{
+    --bar-h: 74px;
+    --chrome-h: 190px;      /* 标题+内边距+底栏占掉的高度；画面最高 = 100vh - 这个值 */
+    --line: #3c4043;
+    --line-soft: #26292d;
+  }
+  html,body{height:100%}
+  body{
+    margin:0; box-sizing:border-box;
+    padding:14px 18px calc(var(--bar-h) + 14px);
+    font:14px/1.55 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+    background:#14161a; color:#e8eaed;
+  }
+  header h1{font-size:16px;margin:0 0 4px}
+  .sub{color:#9aa0a6;font-size:12px;margin-bottom:12px}
+
+  .wrap{display:flex;gap:20px;align-items:flex-start}
+
+  /* ---- 左区：整帧画面 + 紧挨着的水印图层列 ---- */
+  .viewer{
+    flex:1 1 auto; min-width:0;
+    display:flex; gap:16px; align-items:flex-start; justify-content:center;
+    padding:20px;
+    border:1px solid var(--line); border-radius:10px; background:#0f1114;
+  }
+  .stage{
+    position:relative; display:inline-block; line-height:0;
+    max-width:100%; flex:0 1 auto;
+    border:1px solid #4a4f55; border-radius:6px; overflow:hidden; background:#000;
+  }
+  .stage img{
+    display:block; width:auto; height:auto;
+    max-width:100%;
+    max-height:calc(100vh - var(--chrome-h));
+  }
+
+  /* 叠加框：默认完全透明，只承接点击/悬停/选中态（编号已烧在图里） */
+  .box{
+    position:absolute; box-sizing:border-box; border-radius:2px; cursor:pointer;
+    border:2px solid transparent; background:transparent;
+    transition:background .08s linear, border-color .08s linear;
+  }
+  .box:hover{border-color:rgba(255,255,255,.85); background:rgba(255,255,255,.12)}
+  .box.on{border-color:#34c759; background:rgba(52,199,89,.30)}
+
+  /* 水印图层竖列：就在画面右侧 */
+  .layers{
+    flex:0 0 156px; display:flex; flex-direction:column; gap:10px;
+    max-height:calc(100vh - var(--chrome-h)); overflow:auto;
+  }
+  .layers:empty{display:none}
+  .layers .nolayer{
+    display:flex; align-items:center; justify-content:center;
+    height:64px; border:1px dashed #5f6368; border-radius:4px;
+    color:#9aa0a6; font-size:12px; cursor:pointer;
+  }
+  .layers figure{margin:0 0 12px; text-align:center}
+  .layers img{
+    width:100%; height:auto; max-height:260px; object-fit:contain;
+    background:#000; border:1px solid #4a4f55; border-radius:4px;
+    cursor:zoom-in; display:block;
+  }
+  .layers img:hover{border-color:#8ab4f8}
+  .layers figcaption{font-size:11px;color:#9aa0a6;margin-top:2px}
+  /* 遮罩预览：只在 mask 模式下显示 */
+  canvas.maskcv{
+    display:none; width:100%; height:auto; margin-top:6px; background:#000;
+    border:1px solid #8ab4f8; border-radius:4px; image-rendering:pixelated;
+  }
+  .maskopts{display:none;margin-top:8px;padding-top:8px;border-top:1px solid var(--line-soft)}
+  .maskopts.on{display:block}
+  .maskopts label{display:flex;align-items:center;gap:8px;font-size:12px;color:#cfd3d7;padding:3px 0}
+  .maskopts input[type=range]{flex:1;min-width:0}
+  .maskopts .val{color:#8ab4f8;font-variant-numeric:tabular-nums;min-width:34px;text-align:right}
+
+  /* ---- 右列 ---- */
+  .side{
+    flex:0 0 390px; max-width:46vw;
+    display:flex; flex-direction:column; gap:12px;
+    max-height:calc(100vh - var(--chrome-h));
+    overflow:auto; padding-right:4px;
+  }
+  fieldset{border:1px solid var(--line);border-radius:6px;margin:0;padding:8px 12px}
+  legend{color:#9aa0a6;font-size:12px;padding:0 4px}
+  legend button{
+    font:11px/1 sans-serif;padding:3px 7px;margin-left:6px;
+    border:1px solid #5f6368;border-radius:4px;background:#2a2d31;color:#cfd3d7;cursor:pointer;
+  }
+
+  .thumbs{display:flex;gap:10px;flex-wrap:wrap}
+  .thumbs figure{margin:0;text-align:center}
+  .thumbs img{
+    height:72px;width:auto;border:2px solid var(--line);border-radius:4px;cursor:pointer;
+    opacity:.7;display:block;
+  }
+  .thumbs img.on{border-color:#8ab4f8;opacity:1}
+  .thumbs figcaption{font-size:11px;color:#9aa0a6;margin-top:2px}
+
+  /* 区域列表：改成紧凑文字行（水印图挪到画面右侧了，这里不再放小图） */
+  label.row{
+    display:flex; gap:8px; align-items:baseline; padding:5px 0; cursor:pointer;
+    border-top:1px solid var(--line-soft);
+  }
+  label.row:first-child{border-top:0}
+  label.row:hover{background:#1b1e22}
+  label.row input{flex:0 0 auto;margin:0}
+  .txt small{color:#9aa0a6}
+  .hasLayer{color:#8ab4f8;font-size:11px;margin-left:6px}
+
+  .mode label{display:block;padding:4px 0;cursor:pointer}
+  .mode small{color:#9aa0a6;margin-left:6px}
+
+  .bar{
+    position:fixed;left:0;right:0;bottom:0;height:var(--bar-h);box-sizing:border-box;
+    display:flex;gap:12px;align-items:center;padding:0 18px;
+    background:#1e2024;border-top:1px solid var(--line);
+  }
+  button.act{font:14px/1 sans-serif;padding:10px 18px;border-radius:6px;
+    border:1px solid #5f6368;background:#2a2d31;color:#e8eaed;cursor:pointer}
+  button.primary{background:#8ab4f8;color:#15171a;border-color:#8ab4f8;font-weight:700}
+  .count{margin-left:auto;color:#9aa0a6}
+  .done{padding:48px;font-size:16px}
+
+  /* 提交后常驻的提示条：不遮挡内容、可手动关闭，但默认一直挂着提醒"已经操作过了" */
+  .notice{
+    position:fixed; top:0; left:0; right:0; z-index:300;
+    display:flex; align-items:center; gap:10px; padding:12px 18px; font-size:14px;
+    box-shadow:0 4px 18px rgba(0,0,0,.45);
+  }
+  .notice[hidden]{display:none}
+  .notice.ok{background:#1d4630;color:#d8f6e2;border-bottom:1px solid #34c759}
+  .notice.bad{background:#4a1f22;color:#f9dcdc;border-bottom:1px solid #ff453a}
+  .notice .ico{font-size:16px;font-weight:700}
+  .notice .x{
+    margin-left:auto; background:transparent; color:inherit; cursor:pointer;
+    border:1px solid currentColor; border-radius:4px; padding:3px 10px; font:12px/1 sans-serif;
+  }
+  body.has-banner{padding-top:62px}
+  button.act:disabled{opacity:.45; cursor:not-allowed}
+
+  /* 悬停时跟随鼠标的大图 */
+  .zoom{
+    position:fixed; z-index:99; display:none; pointer-events:none;
+    padding:6px; background:#0b0d10; border:1px solid #6b7075; border-radius:6px;
+    box-shadow:0 10px 34px rgba(0,0,0,.65);
+  }
+  .zoom img{display:block; width:auto; height:auto;
+            max-width:min(620px,44vw); max-height:78vh;
+            image-rendering:auto; background:#000}
+  .zoom .cap{font-size:11px;color:#9aa0a6;text-align:center;padding-top:4px}
+</style>
+</head>
+<body>
+
+<!-- 提交后的常驻提示：默认不遮挡任何内容，右上角可手动关掉 -->
+<div class="notice" id="notice" hidden>
+  <span class="ico" id="noticeIco">✓</span>
+  <span id="noticeTxt"></span>
+  <button type="button" class="x" id="noticeX" title="关闭提示（不影响已提交的结果）">关闭提示</button>
+</div>
+
+<header>
+  <h1>__TITLE__</h1>
+  <div class="sub">
+    文件：__FNAME__ ｜ 画面 __W__×__H__ ｜ 检测到 <b>__N__</b> 处疑似水印叠加层。
+    点图上的方框、或勾右侧列表都可以（多选）。图上的 <b>#编号</b> 是程序标好的。
+    画面右侧是该区域的<b>水印图层</b>（扫描器导出的 watermark_regionN_*.png，
+    整段视频的时间累积），<b>鼠标移上去看大图</b>。
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="viewer">
+    <div class="stage" id="stage">
+      <img id="shot" src="__FIRST__" alt="视频截图">
+      <div id="boxes"></div>
+    </div>
+    <!-- 水印图层：紧挨在画面右侧 -->
+    <div class="layers" id="layers"></div>
+  </div>
+
+  <aside class="side">
+    <fieldset>
+      <legend>截图（点缩略图换整帧画面）</legend>
+      <div class="thumbs" id="thumbs"></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>要去掉的区域（可多选）
+        <button type="button" id="all">全选</button>
+        <button type="button" id="none">清空</button>
+      </legend>
+      <div id="list"></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>处理方式</legend>
+      <div class="mode" id="mode"></div>
+      <div class="maskopts" id="maskopts">
+        <label>笔画阈值
+          <input type="range" id="thr" min="0.05" max="0.95" step="0.05">
+          <span class="val" id="thrv"></span>
+        </label>
+        <label>遮罩胖瘦
+          <input type="range" id="dil" min="-3" max="5" step="1">
+          <span class="val" id="dilv"></span>
+        </label>
+        <div class="sub" style="margin:4px 0 0">
+          画面右侧图层下方会实时显示遮罩：<b>白色 = 会被修补的笔画</b>（已自动补洞）。
+          阈值越低抠得越全（图层是空心轮廓，建议 0.2~0.4）。
+          <b>胖瘦</b>：正=膨胀（把笔画盖全），负=腐蚀（怕吃到周围像素时用）。
+
+        </div>
+      </div>
+    </fieldset>
+  </aside>
+</div>
+
+<div class="bar">
+  <button class="act primary" id="ok">确定，去掉选中的水印</button>
+  <button class="act" id="skip">不处理水印，继续</button>
+  <button class="act" id="cancel">取消</button>
+  <span class="count" id="count"></span>
+</div>
+
+<div class="zoom" id="zoom"><img id="zoomimg" alt="放大"><div class="cap" id="zoomcap"></div></div>
+
+<script>
+const REGIONS = __REGIONS__;      // [{x,y,w,h,note,thumb,layer}]
+const FRAMES  = __FRAMES__;             // 带红框编号（大图用）
+const W = __W__, H = __H__;
+const SUBMIT = __SUBMIT__;
+const DEFAULT_MODE = __DEFAULT_MODE__;
+const MASK_THRESHOLD = __MASK_THRESHOLD__;   // 笔画遮罩阈值（界面可拖）
+const MASK_DILATE = __MASK_DILATE__;         // 遮罩胖瘦（正=膨胀，负=腐蚀）
+const MASK_CAP = 320;                        // 预览处理分辨率上限（够看又不卡）
+
+// 处理方式：最推荐的排最前，同时是默认选中项。
+// （Python 侧 --wm-ask 默认传 delogo；想要笔画级清理就在界面上改选 mask）
+const MODES = [
+  ['delogo',    'delogo',    '整块邻域修补，最自然（推荐）'],
+  ['mask',      'mask',      '只补文字笔画（扫描图层做遮罩，最干净）'],
+  ['blur',      'blur',      '局部模糊，痕迹较重'],
+  ['fill',      'fill',      '纯色块盖住，最稳但最显眼'],
+];
+
+const $ = id => document.getElementById(id);
+let sel = new Set();
+let mode = MODES.some(m => m[0] === DEFAULT_MODE) ? DEFAULT_MODE : MODES[0][0];
+let cur = 0;
+
+// 优先用「水印图层」，没有才退回整帧裁的小图
+const picOf = r => r.layer || r.thumb || '';
+
+function renderBoxes(){
+  const host = $('boxes'); host.innerHTML = '';
+  REGIONS.forEach((r, i) => {
+    const d = document.createElement('div');
+    d.className = 'box' + (sel.has(i) ? ' on' : '');
+    d.style.left   = (r.x / W * 100) + '%';
+    d.style.top    = (r.y / H * 100) + '%';
+    d.style.width  = (r.w / W * 100) + '%';
+    d.style.height = (r.h / H * 100) + '%';
+    d.title = '#' + (i + 1) + '　位置 (' + r.x + ',' + r.y + ')　尺寸 ' + r.w + '×' + r.h;
+    d.onclick = e => { e.stopPropagation(); toggle(i); };
+    d.onmouseenter = e => showZoom(picOf(r), i, e);
+    d.onmouseleave = hideZoom;
+    host.appendChild(d);
+  });
+}
+
+function renderList(){
+  const host = $('list'); host.innerHTML = '';
+  REGIONS.forEach((r, i) => {
+    const l = document.createElement('label');
+    l.className = 'row';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox'; cb.checked = sel.has(i);
+    cb.onchange = () => toggle(i);
+    const span = document.createElement('span');
+    span.className = 'txt';
+    span.innerHTML = '<b>#' + (i + 1) + '</b> (' + r.x + ',' + r.y + ') ' + r.w + '×' + r.h
+                   + (r.layer ? '<span class="hasLayer">有图层</span>' : '')
+                   + (r.note ? '<br><small>' + r.note + '</small>' : '');
+    l.appendChild(cb); l.appendChild(span);
+    l.onmouseenter = e => showZoom(picOf(r), i, e);
+    l.onmouseleave = hideZoom;
+    host.appendChild(l);
+  });
+}
+
+const layerImgs = [];
+
+function renderLayerStrip(){
+  const host = $('layers'); host.innerHTML = '';
+  layerImgs.length = 0;
+  REGIONS.forEach((r, i) => {
+    const lsrc = picOf(r);
+    const fig = document.createElement('figure');
+    if (!lsrc) {
+      // 没有图层就**明说**，不要偷偷换成画面裁剪 —— 那样看起来就是"图不对"。
+      const miss = document.createElement('div');
+      miss.className = 'nolayer';
+      miss.textContent = '无图层';
+      miss.title = '扫描时这个区域的水印图层没能导出（检查报告里有没有相关提示）';
+      miss.onclick = () => toggle(i);
+      const cap0 = document.createElement('figcaption');
+      cap0.textContent = '#' + (i + 1);
+      fig.appendChild(miss); fig.appendChild(cap0);
+      host.appendChild(fig);
+      return;
+    }
+    const im = document.createElement('img');
+    im.src = lsrc;
+    im.onclick = () => toggle(i);
+    im.onmouseenter = e => showZoom(lsrc, i, e);
+    im.onmouseleave = hideZoom;
+    im.onload = () => renderMasks();
+    const cap = document.createElement('figcaption');
+    cap.textContent = '#' + (i + 1) + ' 图层';
+    fig.appendChild(im);
+    const mcv = document.createElement('canvas');
+    mcv.className = 'maskcv'; mcv.dataset.i = i;
+    fig.appendChild(mcv);
+    fig.appendChild(cap);
+    host.appendChild(fig);
+    layerImgs[i] = im;
+  });
+}
+
+// 把空心轮廓填成实心：行内「且」列内都被笔画夹住的点补上（与 Python 端一致）
+function fillHoles(bin, w, h){
+  const out = new Uint8Array(bin);
+  const lr = new Uint8Array(w * h), rl = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++){
+    let acc = 0;
+    for (let x = 0; x < w; x++){ const k = y*w+x; acc = bin[k] ? 1 : acc; lr[k] = acc; }
+    acc = 0;
+    for (let x = w - 1; x >= 0; x--){ const k = y*w+x; acc = bin[k] ? 1 : acc; rl[k] = acc; }
+  }
+  const tb = new Uint8Array(w * h), bt = new Uint8Array(w * h);
+  for (let x = 0; x < w; x++){
+    let acc = 0;
+    for (let y = 0; y < h; y++){ const k = y*w+x; acc = bin[k] ? 1 : acc; tb[k] = acc; }
+    acc = 0;
+    for (let y = h - 1; y >= 0; y--){ const k = y*w+x; acc = bin[k] ? 1 : acc; bt[k] = acc; }
+  }
+  for (let k = 0; k < w * h; k++) if ((lr[k] && rl[k]) && (tb[k] && bt[k])) out[k] = 1;
+  return out;
+}
+
+function dilate(bin, w, h, r){
+  const out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let hit = 0;
+      for (let dy = -r; dy <= r && !hit; dy++) {
+        const yy = y + dy; if (yy < 0 || yy >= h) continue;
+        for (let dx = -r; dx <= r; dx++) {
+          const xx = x + dx; if (xx < 0 || xx >= w) continue;
+          if (bin[yy * w + xx]) { hit = 1; break; }
+        }
+      }
+      out[y * w + x] = hit;
+    }
+  }
+  return out;
+}
+
+// 从两个滑块读出当前参数（阈值 / 遮罩胖瘦）
+function maskParams(){
+  return {thr: parseFloat($('thr').value), dil: parseInt($('dil').value, 10) || 0};
+}
+
+function renderMasks(){
+  const on = (mode === 'mask');
+  $('maskopts').classList.toggle('on', on);
+  document.querySelectorAll('canvas.maskcv').forEach(cv => {
+    if (!on) { cv.style.display = 'none'; return; }
+    const img = layerImgs[cv.dataset.i];
+    if (!img || !img.naturalWidth) return;
+    cv.style.display = 'block';
+    const scale = Math.min(1, MASK_CAP / img.naturalWidth);
+    const w = Math.max(8, Math.round(img.naturalWidth * scale));
+    const h = Math.max(8, Math.round(img.naturalHeight * scale));
+    if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+    const ctx = cv.getContext('2d');
+    ctx.drawImage(img, 0, 0, w, h);
+    let d;
+    try { d = ctx.getImageData(0, 0, w, h); } catch (e) { return; }
+    const p = d.data;
+    let lo = 255, hi = 0;
+    for (let k = 0; k < p.length; k += 4) {           // 先转灰度并求极值
+      const v = (p[k] * 0.299 + p[k + 1] * 0.587 + p[k + 2] * 0.114) | 0;
+      p[k] = p[k + 1] = p[k + 2] = v;
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    const {thr, dil} = maskParams();
+    const span = Math.max(1, hi - lo);                // 区域内归一化后再二值化
+    let bin = new Uint8Array(w * h);
+    for (let k = 0; k < w * h; k++) bin[k] = ((p[k * 4] - lo) / span >= thr) ? 1 : 0;
+    bin = fillHoles(bin, w, h);                       // 图层是空心轮廓，必须先补洞
+    const r = Math.max(0, Math.round(dil * scale));   // 膨胀半径按预览缩放同步
+    if (r > 0) bin = dilate(bin, w, h, r);
+    for (let k = 0; k < w * h; k++) {
+      const v = bin[k] ? 255 : 0;
+      p[k * 4] = p[k * 4 + 1] = p[k * 4 + 2] = v;
+    }
+    ctx.putImageData(d, 0, 0);
+  });
+}
+
+function renderThumbs(){
+  const host = $('thumbs'); host.innerHTML = '';
+  FRAMES.forEach((f, i) => {
+    const fig = document.createElement('figure');
+    const im = document.createElement('img');
+    im.src = f; im.className = (i === cur ? 'on' : '');
+    im.onclick = () => { cur = i; $('shot').src = f; renderThumbs(); };
+    const cap = document.createElement('figcaption');
+    cap.textContent = '第 ' + (i + 1) + ' 帧';
+    fig.appendChild(im); fig.appendChild(cap);
+    host.appendChild(fig);
+  });
+}
+
+function renderModes(){
+  $('mode').innerHTML = MODES.map(([v, label, note]) =>
+    '<label><input type="radio" name="m" value="' + v + '"'
+    + (v === mode ? ' checked' : '') + '> <b>' + label + '</b><small>' + note + '</small></label>'
+  ).join('');
+  $('mode').onchange = () => {
+    const c = document.querySelector('input[name=m]:checked');
+    if (c) mode = c.value;
+    renderMasks();
+  };
+}
+
+// ---------- 悬停看大图 ----------
+const zoom = $('zoom'), zoomImg = $('zoomimg'), zoomCap = $('zoomcap');
+function showZoom(src, i, e){
+  if (!src) return;
+  zoomImg.src = src;
+  zoomCap.textContent = '#' + (i + 1) + (REGIONS[i] && REGIONS[i].layer ? ' 水印图层（多帧累积）' : ' 画面裁剪');
+  zoom.style.display = 'block';
+  placeZoom(e);
+}
+function hideZoom(){ zoom.style.display = 'none'; zoomImg.removeAttribute('src'); }
+function placeZoom(e){
+  if (!e) return;
+  const w = zoom.offsetWidth, h = zoom.offsetHeight, pad = 16;
+  let x = e.clientX + pad, y = e.clientY + pad;
+  if (x + w > innerWidth - 8)  x = Math.max(8, e.clientX - w - pad);
+  if (y + h > innerHeight - 8) y = Math.max(8, innerHeight - h - 8);
+  zoom.style.left = x + 'px'; zoom.style.top = y + 'px';
+}
+document.addEventListener('mousemove', e => { if (zoom.style.display === 'block') placeZoom(e); });
+
+function toggle(i){
+  sel.has(i) ? sel.delete(i) : sel.add(i);
+  renderBoxes(); renderList(); updateCount();
+}
+function updateCount(){ $('count').textContent = '已选 ' + sel.size + ' / ' + REGIONS.length + ' 处'; }
+
+// ---------- 提交后的常驻提示（不切页，方便回头核对参数） ----------
+let submitted = false;
+
+function showNotice(kind, text){
+  const n = $('notice');
+  n.className = 'notice ' + kind;
+  n.hidden = false;
+  $('noticeIco').textContent = (kind === 'ok') ? '✓' : '!';
+  $('noticeTxt').textContent = text;
+  document.body.classList.add('has-banner');
+}
+
+$('noticeX').onclick = () => {          // 手动关掉提示；已提交的结果不受影响
+  $('notice').hidden = true;
+  document.body.classList.remove('has-banner');
+};
+
+const ACTION_LABEL = {ok: '确定，去掉选中的水印', none: '不处理水印，继续', cancel: '取消'};
+
+function send(status){
+  if (submitted) return;                // 已提交就不再重复发
+  fetch(SUBMIT, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(Object.assign(
+      {status: status, indices: [...sel].sort((a, b) => a - b), mode: mode},
+      mode === 'mask'
+        ? {mask_threshold: maskParams().thr, mask_dilate: maskParams().dil} : {})),
+  }).then(() => {
+    submitted = true;
+    showNotice('ok', '已提交：' + (ACTION_LABEL[status] || status)
+      + '　—　该视频会按这个选择继续处理。页面保留着，可以回头核对参数；'
+      + '需要重新选就回终端重跑一次。');
+    ['ok', 'skip', 'cancel'].forEach(id => { $(id).disabled = true; });
+    $('ok').textContent = '已提交';
+  }).catch(() => {
+    showNotice('bad', '提交失败，请回终端重新运行。（按钮仍可用，可以再点一次）');
+  });
+}
+
+$('ok').onclick     = () => send(sel.size ? 'ok' : 'none');
+$('skip').onclick   = () => send('none');
+$('cancel').onclick = () => send('cancel');
+$('all').onclick    = () => { REGIONS.forEach((_, i) => sel.add(i)); renderBoxes(); renderList(); updateCount(); };
+$('none').onclick   = () => { sel.clear(); renderBoxes(); renderList(); updateCount(); };
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter') send(sel.size ? 'ok' : 'none');
+  if (e.key === 'Escape') send('cancel');
+});
+
+// 滑块初值来自 Python 侧的默认值
+$('thr').value = MASK_THRESHOLD; $('thrv').textContent = (+MASK_THRESHOLD).toFixed(2);
+$('dil').value = MASK_DILATE;    $('dilv').textContent = String(MASK_DILATE);
+$('thr').addEventListener('input', () => { $('thrv').textContent = (+$('thr').value).toFixed(2); renderMasks(); });
+$('dil').addEventListener('input', () => { $('dilv').textContent = $('dil').value; renderMasks(); });
+
+renderModes(); renderBoxes(); renderList(); renderLayerStrip(); renderThumbs(); renderMasks(); updateCount();
+</script>
+</body>
+</html>
